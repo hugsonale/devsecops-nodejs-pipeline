@@ -1,0 +1,91 @@
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+
+jobs:
+  # 1. Build and Test -----------------------------------------------------------
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run tests
+        run: npm test
+
+
+  # 2. SonarQube (SAST) --------------------------------------------------------
+  sonarqube-sast:
+    needs: build-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v2
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+  
+  # 3. Dependency Check ---------------------------------------------------------
+  dependency-check:
+    needs: sonarqube-sast
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Run OWASP Dependency Check
+        run: |
+          docker run --rm \
+            -v $(pwd):/src \
+            owasp/dependency-check \
+            --scan /src \
+            --format "JSON" \
+            --project "devsecops-nodejs-app" \
+            --out /src/reports
+
+      - name: Fail if High/Critical CVEs found
+        run: |
+          cat reports/dependency-check-report.json | jq '
+          if (.Vulnerabilities | map(select(.severity == "High" or .severity == "Critical")) | length) > 0
+          then exit(1)
+          else exit(0)
+          end'
+
+
+  # 4. Container Scan (Trivy) ---------------------------------------------------
+  trivy-container-scan:
+    needs: dependency-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Build Docker Image
+        run: docker build -t devsecops-nodejs-app:latest .
+
+      - name: Install Trivy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget
+          wget https://github.com/aquasecurity/trivy/releases/latest/download/trivy_0.45.0_Linux-64bit.deb
+          sudo dpkg -i trivy_0.45.0_Linux-64bit.deb
+
+      - name: Scan Image with Trivy
+        run: |
+          trivy image --exit-code 1 --severity HIGH,CRITICAL devsecops-nodejs-app:latest
+
+
+  # 5. Deployment Gate ----------------------------------------------------------
+  deploy:
+    needs: trivy-container-scan
+    runs-on: ubuntu-latest
+    if: success()
+    steps:
+      - name: Deploy to environment
+        run: echo "All security checks passed. Safe to deploy."
